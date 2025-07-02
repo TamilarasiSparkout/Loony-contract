@@ -57,7 +57,7 @@ contract CrowdSale is
         uint256 usdtContributed;
         uint256 LoonyReceived;
     }
-
+    
     mapping(address => UserInfo) public users;
 
     event TokenPurchase(address indexed purchaser, address indexed beneficiary, uint256 value, uint256 amount);
