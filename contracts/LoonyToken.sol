@@ -8,38 +8,33 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+interface IUniswapV2Router {
+    function factory() external view returns (address);
+    function WETH() external view returns (address);
+}
+
+interface IUniswapV2Factory {
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+}
+
 contract LoonyToken is
     Initializable,
     ERC20Upgradeable,
     OwnableUpgradeable,
     PausableUpgradeable,
     UUPSUpgradeable
-{    
+{
     using SafeERC20 for IERC20;
 
-    uint256 public sellLimit;
-    uint256 public totalTaxPercentage;
-    // uint256 public treasuryPercentage;
-    // uint256 public donationPercentage;
-    // uint256 public burnPercentage;
-
+    uint256 public taxPercentage; // 2 = 2%
     address public donationWallet;
     address public treasuryWallet;
-    // address public burnWallet;
-    address public DEXPair;
+
+    address public router;
+    address public dexPair;
+    bool public  isLiquidityEnabled;
 
     mapping(address => bool) public isExcludedFromTax;
-    mapping(address => bool) public isDEXPair;
-
-    event Initialized(address indexed owner, address donation, address treasury);
-
-    address public adminWallet;
-    uint256 public totalBurned;
-    uint256 public constant MAX_BURN = 5_000_000 * 1e18;
-    uint256 public constant QUARTERLY_BURN_AMOUNT = 625_000 * 1e18;
-
-    uint256 public launchTime;
-    uint256 public lastBurnTime;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -47,63 +42,88 @@ contract LoonyToken is
     }
 
     function initialize(
+        address _router,
         address _donationWallet,
         address _treasuryWallet
-             
-     ) public initializer {
-        emit Initialized(msg.sender, _donationWallet, _treasuryWallet);
+    ) public initializer {
         __ERC20_init("LoonyToken", "$LOONY");
         __Ownable_init(msg.sender);
         __UUPSUpgradeable_init();
         __Pausable_init();
-       
-        uint256 totalSupply = 1_000_000_000 * 1e18; // 1 billion
-        _mint(msg.sender, totalSupply);
 
-        donationWallet = _donationWallet;
-        treasuryWallet = _treasuryWallet;
-
-        totalTaxPercentage = 2;
-        // treasuryPercentage = 1;
-        // donationPercentage = 1;
-        // burnPercentage = 1;
-        sellLimit = 1000 * 1e18;
-        launchTime = block.timestamp;
-        adminWallet = msg.sender;
-
+        require(_router != address(0), "Router address is zero");
         require(_donationWallet != address(0), "Invalid donation wallet");
         require(_treasuryWallet != address(0), "Invalid treasury wallet");
-        // require(_burnWallet !=address(0), "Invalid burn Wallet");
-        
+
+        uint256 totalSupply = 1_000_000_000 * 1e18;
+        _mint(msg.sender, totalSupply);
+
+        router = _router;
+        donationWallet = _donationWallet;
+        treasuryWallet = _treasuryWallet;
+        taxPercentage = 2;
+
+        IUniswapV2Router uniRouter = IUniswapV2Router(router);
+        dexPair = IUniswapV2Factory(uniRouter.factory()).createPair(address(this), uniRouter.WETH());
+
         isExcludedFromTax[msg.sender] = true;
+        isLiquidityEnabled = false;
+        // isExcludedFromTax[address(this)] = true;
 
     }
 
-    function _update(address from, address to, uint256 amount) internal virtual override whenNotPaused {
-    
-    bool isBuy = isDEXPair[from];
-    bool isSell = isDEXPair[to];
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
-    if ((isBuy || isSell) && !isExcludedFromTax[from] && !isExcludedFromTax[to]) {
+    function _update(address from, address to, uint256 amount) internal override whenNotPaused {
+        bool isBuy = from == dexPair;
+        bool isSell = to == dexPair;
+ 
+    // Skip tax for owner (for liquidity operations) or if sender/recipient is excluded
+        if ( isLiquidityEnabled || isExcludedFromTax[from] || isExcludedFromTax[to] ) {
+            super._update(from, to, amount);
+            return;
+        }
+ 
+    // Apply tax only for buy/sell on DEX
+        if (isBuy || isSell) {
+            uint256 taxAmount = (amount * taxPercentage) / 100;
+            uint256 netAmount = amount - taxAmount;
 
-        uint256 totalTaxAmount = (amount * totalTaxPercentage) / 100;
+            uint256 halfTax = taxAmount / 2;
+            uint256 remaining = taxAmount - halfTax;
 
-        // Equal split
-        uint256 halfTax = totalTaxAmount / 2;
+        // Send tax to wallets
+            super._update(from, donationWallet, halfTax);
+            super._update(from, treasuryWallet, remaining);
 
-        super._update(from, treasuryWallet, halfTax);     // 50% to treasury
-        super._update(from, donationWallet, totalTaxAmount - halfTax); // 50% to donation 
-
-        uint256 netAmount = amount - totalTaxAmount;
-        super._update(from, to, netAmount); // send remaining to recipient
-
-    } else {
-        super._update(from, to, amount); // no tax
+        // Transfer remaining to receiver
+            super._update(from, to, netAmount);
+        } else {
+            super._update(from, to, amount);
     }
 }
+  
+    function burn(uint256 amount) external onlyOwner {
+        _burn(msg.sender, amount);
+    }
 
-    
-    // Admin control functions
+    // Owner Functions
+    function setTaxPercentage(uint256 _percent) external onlyOwner {
+        require(_percent <= 10, "Too high");
+        taxPercentage = _percent;
+    }
+
+    function setWallets(address _donation, address _treasury) external onlyOwner {
+        require(_donation != address(0) && _treasury != address(0), "Invalid address");
+        donationWallet = _donation;
+        treasuryWallet = _treasury;
+    }
+
+    function excludeFromTax(address addr, bool excluded) external onlyOwner {
+        isExcludedFromTax[addr] = excluded;
+    }
+
+    // Pause
     function pause() external onlyOwner {
         _pause();
     }
@@ -112,94 +132,4 @@ contract LoonyToken is
         _unpause();
     }
 
-    function burn(uint256 amount) external onlyOwner {
-        _burn(msg.sender, amount);
-    }
-
-    event QuarterlyBurn(uint256 timestamp, uint256 amount, uint256 totalBurned);
-
-    function burnFromAdminWallet() external onlyOwner {
-        require(block.timestamp >= launchTime + 365 days, "Burning not yet started");
-        require(block.timestamp >= lastBurnTime + 90 days, "Quarter not reached");
-        require(totalBurned < MAX_BURN, "Max burn completed");
-
-        uint256 amountToBurn = QUARTERLY_BURN_AMOUNT;
-        if (totalBurned + amountToBurn > MAX_BURN) {
-            amountToBurn = MAX_BURN - totalBurned;
-        }
-
-        require(balanceOf(adminWallet) >= amountToBurn, "Insufficient tokens in admin wallet");
-
-        _burn(adminWallet, amountToBurn);
-
-        totalBurned += amountToBurn;
-        lastBurnTime = block.timestamp;
-
-        emit QuarterlyBurn(block.timestamp, amountToBurn, totalBurned);
-    }
-
-    function setAdminWallet(address newAdmin) external onlyOwner {
-        require(newAdmin != address(0), "Zero address");
-        adminWallet = newAdmin;
-    }
-
-    function totalBurnedTokens() external view returns (uint256) {
-        return totalBurned / 1e18;
-    }
-
-    function setDEXPair(address pair, bool value) external onlyOwner {
-        require(pair != address(0), "Zero address");
-        isDEXPair[pair] = value;
-    }
-
-    function setTotalTaxPercentage(uint256 _newTax) external onlyOwner {
-        require(_newTax <= 10, "Too high");
-        totalTaxPercentage = _newTax;
-    }
-
-    // function setDonationTaxPercentage(uint256 _newDonationTax) external onlyOwner{
-    //     require(_newDonationTax <= 10, "Too high");
-    //     donationPercentage = _newDonationTax;
-    // }
-
-    // function setTreasuryTaxPercentage(uint256 _newTreasuryTax) external onlyOwner{
-    //     require(_newTreasuryTax <=10, "Too high");
-    //     treasuryPercentage = _newTreasuryTax;
-    // }
-    
-    // function setBurnPercentage(uint256 _burn) external onlyOwner {
-    //     require(_burn <= 10, "Too high");
-    //     burnPercentage = _burn;
-    // }
-
-    function setSellLimit(uint256 newLimit) external onlyOwner {
-        require(newLimit > 0, "Sell limit must be positive");
-        sellLimit = newLimit;
-    }
-
-    function setTaxExclusion(address account, bool excluded) external onlyOwner {
-        isExcludedFromTax[account] = excluded;
-    }
-
-    function updateWallets(
-        address _donationWallet,
-        address _treasuryWallet
-        // address _burnWallet
-    ) external onlyOwner {
-        require(_donationWallet != address(0), "Invalid donation wallet");
-        require(_treasuryWallet != address(0), "Invalid treasury wallet");
-        // require(_burnWallet != address(0), "Invalid Burn Wallet");
-        
-        donationWallet = _donationWallet;
-        treasuryWallet = _treasuryWallet;
-        // burnWallet = _burnWallet;
-    }
-
-    function withdrawTokens(address token, uint256 amount) external onlyOwner {
-        require(token != address(this), "Cannot withdraw own tokens");
-        IERC20(token).safeTransfer(owner(), amount);
-    }
-
-    // Required for UUPS upgradeability
-    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 }
